@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -106,53 +105,13 @@ func main() {
 		}
 	}()
 
-	hostname, err := getHostname(target)
+	scope, err := NewCrawlScope(target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Target URL is invalid: %v", err)
 		os.Exit(1)
 	}
 
-	// Instantiate default collector
-	c := colly.NewCollector(
-		colly.MaxDepth(depth),
-		colly.Async(),
-	)
-	c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: threads})
-
-	// Allow URLs from the same domain and its subdomains
-	c.URLFilters = []*regexp.Regexp{
-		regexp.MustCompile(".*" + strings.ReplaceAll(hostname, ".", "\\.") + ".*"),
-	}
-
-	// Add headers
-	c.OnRequest(func(r *colly.Request) {
-		// Set a random user agent for each request
-		rand.Seed(time.Now().Unix())
-		n := rand.Intn(len(userAgents))
-		r.Headers.Set("User-Agent", userAgents[n])
-		// Add other headers
-		for header, value := range headers {
-			r.Headers.Set(header, value)
-		}
-	})
-
-	// Accept untrusted SSL/TLS certificates based on the value of `-insecure` flag
-	c.WithTransport(&http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
-	})
-
-	// On every a element which has href attribute call callback
-	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
-		link := e.Attr("href")
-		// Print link if it's in-scope and has not been visited
-		visited, _ := c.HasVisited(link)
-		if checkOrigin(link, target) && !visited {
-			fmt.Println(link)
-		}
-
-		// Visit link found on page on a new thread
-		e.Request.Visit(link)
-	})
+	c := newCrawler(scope, depth, threads)
 
 	// Register a function that logs HTML attributes
 	for tag, attribute := range config.LogQueries {
@@ -209,6 +168,71 @@ func main() {
 	c.Wait()
 
 	writeAllResults(config)
+}
+
+// newCrawler builds a collector that never leaves the given origin scope.
+func newCrawler(scope *CrawlScope, maxDepth, parallelism int) *colly.Collector {
+	c := colly.NewCollector(
+		colly.MaxDepth(maxDepth),
+		colly.Async(),
+	)
+	c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: parallelism})
+
+	// Re-validate every redirect target against the exact origin scope so
+	// that an in-scope URL cannot bounce the crawler onto a third party.
+	c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
+		base := via[len(via)-1].URL
+		if !scope.Allows(req.URL.String(), base) {
+			return fmt.Errorf("redirect target %q is outside the crawl scope", req.URL.String())
+		}
+		if len(via) >= 10 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	})
+
+	// Add headers
+	c.OnRequest(func(r *colly.Request) {
+		// Set a random user agent for each request
+		rand.Seed(time.Now().Unix())
+		n := rand.Intn(len(userAgents))
+		r.Headers.Set("User-Agent", userAgents[n])
+		// Add other headers
+		for header, value := range headers {
+			r.Headers.Set(header, value)
+		}
+	})
+
+	// Out-of-scope links and redirects are expected; swallow their errors so
+	// they don't clutter the output of a crawl.
+	c.OnError(func(r *colly.Response, err error) {
+		if r != nil && r.Request != nil && !scope.Allows(r.Request.URL.String(), nil) {
+			return
+		}
+	})
+
+	// Accept untrusted SSL/TLS certificates based on the value of `-insecure` flag
+	c.WithTransport(&http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+	})
+
+	// On every a element which has href attribute call callback
+	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
+		link := e.Attr("href")
+		if !scope.Allows(link, e.Request.URL) {
+			return
+		}
+		// Print link if it's in-scope and has not been visited
+		visited, _ := c.HasVisited(link)
+		if !visited {
+			fmt.Println(link)
+		}
+
+		// Visit link found on page on a new thread
+		e.Request.Visit(link)
+	})
+
+	return c
 }
 
 func writeAllResults(config Configuration) {
@@ -276,34 +300,6 @@ func writeResults(filename string, content map[string]map[string][]string, resul
 		return fmt.Errorf("coudln't write resources to JSON: %v", err)
 	}
 	return nil
-}
-
-func getHostname(rawURL string) (string, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", err
-	}
-	return u.Hostname(), nil
-}
-
-func checkOrigin(link, base string) bool {
-	linkurl, err := url.Parse(link)
-	if err != nil {
-		return false
-	}
-
-	linkhost := linkurl.Hostname()
-
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return false
-	}
-	basehost := baseURL.Hostname()
-
-	// check the main domain not the subdomain
-	// checkOrigin ("https://docs.google.com", "https://mail.google.com") => true
-	re, _ := regexp.Compile(`[\w-]*\.[\w]*$`)
-	return re.FindString(linkhost) == re.FindString(basehost)
 }
 
 func isValidURL(s string) bool {
